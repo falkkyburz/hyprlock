@@ -30,7 +30,9 @@ class CFingerprint : public IAuthImplementation {
         bool                           done      = false;
         int                            retries   = 0;
         bool                           sleeping  = false;
-        bool                           verifying = false;
+        bool                           verifying      = false;
+        bool                           releasing      = false;
+        bool                           startScheduled = false;
     } m_sDBUSState;
 
     std::string m_sFingerprintReady;
@@ -43,7 +45,10 @@ class CFingerprint : public IAuthImplementation {
 
     bool        createDeviceProxy();
     void        claimDevice();
+    void        scheduleStartVerify();
     void        startVerify(bool isRetry = false);
+    void        stopVerifyAsync(bool release);
+    void        releaseDeviceAsync();
     bool        stopVerify();
     bool        releaseDevice();
 };
