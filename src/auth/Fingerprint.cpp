@@ -44,6 +44,8 @@ CFingerprint::CFingerprint() {
     m_sFingerprintReady                  = *FINGERPRINTREADY;
     static const auto FINGERPRINTPRESENT = g_pConfigManager->getValue<Hyprlang::STRING>("auth:fingerprint:present_message");
     m_sFingerprintPresent                = *FINGERPRINTPRESENT;
+    static const auto VERIFYTIMEOUT      = g_pConfigManager->getValue<Hyprlang::INT>("auth:fingerprint:verification_timeout");
+    m_iVerificationTimeout               = *VERIFYTIMEOUT;
 }
 
 CFingerprint::~CFingerprint() {
@@ -56,24 +58,10 @@ void CFingerprint::init() {
         return;
     }
 
-    g_dbus->m_freedesktopLogin1->getPropertyAsync("PreparingForSleep")
-        .onInterface(LOGIN_MANAGER)
-        .uponReplyInvoke([this](std::optional<sdbus::Error> e, sdbus::Variant preparingForSleep) {
-            if (e) {
-                Log::logger->log(Log::WARN, "fprint: Failed getting value for PreparingForSleep: {}", e->what());
-                return;
-            }
-            m_sDBUSState.sleeping = preparingForSleep.get<bool>();
-            // When entering sleep, the wake signal will trigger startVerify().
-            if (m_sDBUSState.sleeping)
-                return;
-
-            scheduleStartVerify();
-        });
-
     g_dbus->m_freedesktopLogin1->uponSignal("PrepareForSleep").onInterface(LOGIN_MANAGER).call([this](bool start) {
         Log::logger->log(Log::INFO, "fprint: PrepareForSleep (start: {})", start);
-        m_sDBUSState.sleeping = start;
+        m_sDBUSState.sleepSignalSeen = true;
+        m_sDBUSState.sleeping        = start;
         if (m_sDBUSState.sleeping) {
             if (m_sDBUSState.verifying)
                 stopVerifyAsync(true);
@@ -82,9 +70,37 @@ void CFingerprint::init() {
             return;
         }
 
-        if (!m_sDBUSState.verifying && !m_sDBUSState.releasing)
+        if (m_sDBUSState.releasing) {
+            Log::logger->log(Log::INFO, "fprint: retrying pending verification stop after wake");
+            m_sDBUSState.releasing = false;
+            if (m_sDBUSState.device) {
+                stopVerifyAsync(true);
+                return;
+            }
+        }
+
+        if (!m_sDBUSState.verifying)
             scheduleStartVerify();
     });
+
+    g_dbus->m_freedesktopLogin1->getPropertyAsync("PreparingForSleep")
+        .onInterface(LOGIN_MANAGER)
+        .uponReplyInvoke([this](std::optional<sdbus::Error> e, sdbus::Variant preparingForSleep) {
+            if (e) {
+                Log::logger->log(Log::WARN, "fprint: Failed getting value for PreparingForSleep: {}", e->what());
+                return;
+            }
+
+            if (m_sDBUSState.sleepSignalSeen)
+                return;
+
+            m_sDBUSState.sleeping = preparingForSleep.get<bool>();
+            // When entering sleep, the wake signal will trigger startVerify().
+            if (m_sDBUSState.sleeping)
+                return;
+
+            scheduleStartVerify();
+        });
 }
 
 void CFingerprint::handleInput(const std::string& input) {
@@ -108,6 +124,11 @@ bool CFingerprint::checkWaiting() {
 }
 
 void CFingerprint::terminate() {
+    if (m_pRefreshTimer) {
+        m_pRefreshTimer->cancel();
+        m_pRefreshTimer.reset();
+    }
+
     if (!m_sDBUSState.abort)
         releaseDevice();
 }
@@ -124,6 +145,7 @@ bool CFingerprint::createDeviceProxy() {
     }
     Log::logger->log(Log::INFO, "fprint: using device path {}", path.c_str());
     m_sDBUSState.device = sdbus::createProxy(*g_dbus->m_connection, FPRINT, path);
+    m_sDBUSState.deviceGeneration++;
 
     m_sDBUSState.device->uponSignal("VerifyFingerSelected").onInterface(DEVICE).call([](const std::string& finger) {
         Log::logger->log(Log::INFO, "fprint: finger selected: {}", finger);
@@ -141,6 +163,10 @@ bool CFingerprint::createDeviceProxy() {
                 bool       isPresent      = presentVariant.get<bool>();
                 if (!isPresent)
                     return;
+
+                if (!m_sDBUSState.verifying && !m_sDBUSState.releasing && !m_sDBUSState.sleeping)
+                    startVerify();
+
                 m_sPrompt = m_sFingerprintPresent;
                 g_pHyprlock->enqueueForceUpdateTimers();
             } catch (std::out_of_range& e) {}
@@ -214,7 +240,11 @@ void CFingerprint::handleVerifyStatus(const std::string& result, bool done) {
 
 void CFingerprint::claimDevice() {
     const auto currentUser = ""; // Empty string means use the caller's id.
-    m_sDBUSState.device->callMethodAsync("Claim").onInterface(DEVICE).withArguments(currentUser).uponReplyInvoke([this](std::optional<sdbus::Error> e) {
+    const auto generation  = m_sDBUSState.deviceGeneration;
+    m_sDBUSState.device->callMethodAsync("Claim").onInterface(DEVICE).withArguments(currentUser).uponReplyInvoke([this, generation](std::optional<sdbus::Error> e) {
+        if (generation != m_sDBUSState.deviceGeneration)
+            return;
+
         if (e)
             Log::logger->log(Log::WARN, "fprint: could not claim device, {}", e->what());
         else {
@@ -240,6 +270,28 @@ void CFingerprint::scheduleStartVerify() {
     }, this);
 }
 
+void CFingerprint::scheduleRefreshTimer() {
+    if (m_iVerificationTimeout <= 0 || m_sDBUSState.done || m_sDBUSState.abort)
+        return;
+
+    if (m_pRefreshTimer) {
+        m_pRefreshTimer->cancel();
+        m_pRefreshTimer.reset();
+    }
+
+    m_pRefreshTimer = g_pHyprlock->addTimer(std::chrono::seconds(m_iVerificationTimeout), [](ASP<CTimer> self, void* data) { ((CFingerprint*)data)->refreshVerify(); }, this);
+}
+
+void CFingerprint::refreshVerify() {
+    m_pRefreshTimer.reset();
+
+    if (!m_sDBUSState.verifying || m_sDBUSState.sleeping || m_sDBUSState.releasing || m_sDBUSState.done || m_sDBUSState.abort)
+        return;
+
+    Log::logger->log(Log::INFO, "fprint: refreshing verification");
+    stopVerifyAsync(true);
+}
+
 void CFingerprint::startVerify(bool isRetry) {
     if (m_sDBUSState.sleeping || m_sDBUSState.releasing) {
         m_sDBUSState.verifying = false;
@@ -257,7 +309,11 @@ void CFingerprint::startVerify(bool isRetry) {
         return;
     }
     auto finger = "any"; // Any finger.
-    m_sDBUSState.device->callMethodAsync("VerifyStart").onInterface(DEVICE).withArguments(finger).uponReplyInvoke([this, isRetry](std::optional<sdbus::Error> e) {
+    const auto generation = m_sDBUSState.deviceGeneration;
+    m_sDBUSState.device->callMethodAsync("VerifyStart").onInterface(DEVICE).withArguments(finger).uponReplyInvoke([this, isRetry, generation](std::optional<sdbus::Error> e) {
+        if (generation != m_sDBUSState.deviceGeneration)
+            return;
+
         if (e) {
             m_sDBUSState.verifying = false;
             Log::logger->log(Log::WARN, "fprint: could not start verifying, {}", e->what());
@@ -274,6 +330,8 @@ void CFingerprint::startVerify(bool isRetry) {
                 m_sPrompt = "Could not match fingerprint. Try again.";
             } else
                 m_sPrompt = m_sFingerprintReady;
+
+            scheduleRefreshTimer();
         }
         g_pHyprlock->enqueueForceUpdateTimers();
     });
@@ -290,7 +348,11 @@ void CFingerprint::stopVerifyAsync(bool release) {
     if (release)
         m_sDBUSState.releasing = true;
 
-    m_sDBUSState.device->callMethodAsync("VerifyStop").onInterface(DEVICE).uponReplyInvoke([this, release](std::optional<sdbus::Error> e) {
+    const auto generation = m_sDBUSState.deviceGeneration;
+    m_sDBUSState.device->callMethodAsync("VerifyStop").onInterface(DEVICE).uponReplyInvoke([this, release, generation](std::optional<sdbus::Error> e) {
+        if (generation != m_sDBUSState.deviceGeneration)
+            return;
+
         if (e)
             Log::logger->log(Log::WARN, "fprint: could not stop verifying, {}", e->what());
         else
@@ -310,13 +372,18 @@ void CFingerprint::releaseDeviceAsync() {
     }
 
     m_sDBUSState.releasing = true;
-    m_sDBUSState.device->callMethodAsync("Release").onInterface(DEVICE).uponReplyInvoke([this](std::optional<sdbus::Error> e) {
+    const auto generation = m_sDBUSState.deviceGeneration;
+    m_sDBUSState.device->callMethodAsync("Release").onInterface(DEVICE).uponReplyInvoke([this, generation](std::optional<sdbus::Error> e) {
+        if (generation != m_sDBUSState.deviceGeneration)
+            return;
+
         if (e)
             Log::logger->log(Log::WARN, "fprint: could not release device, {}", e->what());
         else
             Log::logger->log(Log::INFO, "fprint: released device");
 
         m_sDBUSState.device.reset();
+        m_sDBUSState.deviceGeneration++;
         m_sDBUSState.releasing = false;
 
         if (!m_sDBUSState.sleeping && !m_sDBUSState.verifying && !m_sDBUSState.done && !m_sDBUSState.abort)
@@ -346,10 +413,12 @@ bool CFingerprint::releaseDevice() {
     } catch (sdbus::Error& e) {
         Log::logger->log(Log::WARN, "fprint: could not release device, {}", e.what());
         m_sDBUSState.device.reset();
+        m_sDBUSState.deviceGeneration++;
         return false;
     }
 
     m_sDBUSState.device.reset();
+    m_sDBUSState.deviceGeneration++;
     Log::logger->log(Log::INFO, "fprint: released device");
     return true;
 }

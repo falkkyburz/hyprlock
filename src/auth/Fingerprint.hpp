@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <cstdint>
 #include <sdbus-c++/sdbus-c++.h>
 
 class CFingerprint : public IAuthImplementation {
@@ -29,23 +30,30 @@ class CFingerprint : public IAuthImplementation {
         bool                           abort     = false;
         bool                           done      = false;
         int                            retries   = 0;
-        bool                           sleeping  = false;
-        bool                           verifying      = false;
-        bool                           releasing      = false;
-        bool                           startScheduled = false;
+        bool                           sleeping         = false;
+        bool                           verifying        = false;
+        bool                           releasing        = false;
+        bool                           startScheduled   = false;
+        bool                           sleepSignalSeen  = false;
+        uint64_t                       deviceGeneration = 0;
     } m_sDBUSState;
 
     std::string m_sFingerprintReady;
     std::string m_sFingerprintPresent;
+    int         m_iVerificationTimeout = 0;
 
     std::string m_sPrompt{""};
     std::string m_sFailureReason{""};
+
+    ASP<CTimer> m_pRefreshTimer;
 
     void        handleVerifyStatus(const std::string& result, const bool done);
 
     bool        createDeviceProxy();
     void        claimDevice();
     void        scheduleStartVerify();
+    void        scheduleRefreshTimer();
+    void        refreshVerify();
     void        startVerify(bool isRetry = false);
     void        stopVerifyAsync(bool release);
     void        releaseDeviceAsync();
