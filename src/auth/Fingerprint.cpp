@@ -63,23 +63,31 @@ void CFingerprint::init() {
         m_sDBUSState.sleepSignalSeen = true;
         m_sDBUSState.sleeping        = start;
         if (m_sDBUSState.sleeping) {
-            if (m_sDBUSState.verifying)
+            if (m_sDBUSState.verifying || m_sDBUSState.verifyStarted)
                 stopVerifyAsync(true);
-            else if (m_sDBUSState.device)
+            else if (m_sDBUSState.claimed)
                 releaseDeviceAsync();
+            else if (m_sDBUSState.device)
+                dropDeviceProxy();
             return;
         }
 
         if (m_sDBUSState.releasing) {
             Log::logger->log(Log::INFO, "fprint: retrying pending verification stop after wake");
             m_sDBUSState.releasing = false;
-            if (m_sDBUSState.device) {
+            if (m_sDBUSState.device && m_sDBUSState.claimed && m_sDBUSState.verifyStarted) {
                 stopVerifyAsync(true);
                 return;
             }
+            if (m_sDBUSState.device && m_sDBUSState.claimed) {
+                releaseDeviceAsync();
+                return;
+            }
+            if (m_sDBUSState.device)
+                dropDeviceProxy();
         }
 
-        if (!m_sDBUSState.verifying)
+        if (!m_sDBUSState.verifying && !m_sDBUSState.claiming)
             scheduleStartVerify();
     });
 
@@ -146,6 +154,9 @@ bool CFingerprint::createDeviceProxy() {
     Log::logger->log(Log::INFO, "fprint: using device path {}", path.c_str());
     m_sDBUSState.device = sdbus::createProxy(*g_dbus->m_connection, FPRINT, path);
     m_sDBUSState.deviceGeneration++;
+    m_sDBUSState.claiming      = false;
+    m_sDBUSState.claimed       = false;
+    m_sDBUSState.verifyStarted = false;
 
     m_sDBUSState.device->uponSignal("VerifyFingerSelected").onInterface(DEVICE).call([](const std::string& finger) {
         Log::logger->log(Log::INFO, "fprint: finger selected: {}", finger);
@@ -164,7 +175,7 @@ bool CFingerprint::createDeviceProxy() {
                 if (!isPresent)
                     return;
 
-                if (!m_sDBUSState.verifying && !m_sDBUSState.releasing && !m_sDBUSState.sleeping)
+                if (!m_sDBUSState.verifying && !m_sDBUSState.claiming && !m_sDBUSState.releasing && !m_sDBUSState.sleeping)
                     startVerify();
 
                 m_sPrompt = m_sFingerprintPresent;
@@ -173,6 +184,14 @@ bool CFingerprint::createDeviceProxy() {
         });
 
     return true;
+}
+
+void CFingerprint::dropDeviceProxy() {
+    m_sDBUSState.device.reset();
+    m_sDBUSState.deviceGeneration++;
+    m_sDBUSState.claiming      = false;
+    m_sDBUSState.claimed       = false;
+    m_sDBUSState.verifyStarted = false;
 }
 
 void CFingerprint::handleVerifyStatus(const std::string& result, bool done) {
@@ -239,15 +258,31 @@ void CFingerprint::handleVerifyStatus(const std::string& result, bool done) {
 }
 
 void CFingerprint::claimDevice() {
+    if (!m_sDBUSState.device || m_sDBUSState.claiming || m_sDBUSState.claimed)
+        return;
+
+    m_sDBUSState.claiming = true;
+
     const auto currentUser = ""; // Empty string means use the caller's id.
     const auto generation  = m_sDBUSState.deviceGeneration;
     m_sDBUSState.device->callMethodAsync("Claim").onInterface(DEVICE).withArguments(currentUser).uponReplyInvoke([this, generation](std::optional<sdbus::Error> e) {
         if (generation != m_sDBUSState.deviceGeneration)
             return;
 
-        if (e)
-            Log::logger->log(Log::WARN, "fprint: could not claim device, {}", e->what());
-        else {
+        m_sDBUSState.claiming = false;
+
+        if (e) {
+            Log::logger->log(Log::WARN, "fprint: could not claim device, {}; retrying", e->what());
+            m_sDBUSState.verifying = false;
+            m_sPrompt              = "Fingerprint device busy";
+            dropDeviceProxy();
+
+            if (!m_sDBUSState.sleeping && !m_sDBUSState.done && !m_sDBUSState.abort)
+                scheduleStartVerify();
+
+            g_pHyprlock->enqueueForceUpdateTimers();
+        } else {
+            m_sDBUSState.claimed = true;
             Log::logger->log(Log::INFO, "fprint: claimed device");
             if (m_sDBUSState.sleeping) {
                 releaseDeviceAsync();
@@ -259,7 +294,8 @@ void CFingerprint::claimDevice() {
 }
 
 void CFingerprint::scheduleStartVerify() {
-    if (m_sDBUSState.sleeping || m_sDBUSState.verifying || m_sDBUSState.releasing || m_sDBUSState.startScheduled)
+    if (m_sDBUSState.sleeping || m_sDBUSState.verifying || m_sDBUSState.claiming || m_sDBUSState.releasing || m_sDBUSState.startScheduled || m_sDBUSState.done ||
+        m_sDBUSState.abort)
         return;
 
     m_sDBUSState.startScheduled = true;
@@ -285,7 +321,7 @@ void CFingerprint::scheduleRefreshTimer() {
 void CFingerprint::refreshVerify() {
     m_pRefreshTimer.reset();
 
-    if (!m_sDBUSState.verifying || m_sDBUSState.sleeping || m_sDBUSState.releasing || m_sDBUSState.done || m_sDBUSState.abort)
+    if (!m_sDBUSState.verifying || !m_sDBUSState.verifyStarted || m_sDBUSState.sleeping || m_sDBUSState.releasing || m_sDBUSState.done || m_sDBUSState.abort)
         return;
 
     Log::logger->log(Log::INFO, "fprint: refreshing verification");
@@ -293,10 +329,13 @@ void CFingerprint::refreshVerify() {
 }
 
 void CFingerprint::startVerify(bool isRetry) {
-    if (m_sDBUSState.sleeping || m_sDBUSState.releasing) {
+    if (m_sDBUSState.sleeping || m_sDBUSState.releasing || m_sDBUSState.done || m_sDBUSState.abort) {
         m_sDBUSState.verifying = false;
         return;
     }
+
+    if (m_sDBUSState.claiming)
+        return;
 
     m_sDBUSState.verifying = true;
     if (!m_sDBUSState.device) {
@@ -308,6 +347,15 @@ void CFingerprint::startVerify(bool isRetry) {
         claimDevice();
         return;
     }
+
+    if (!m_sDBUSState.claimed) {
+        claimDevice();
+        return;
+    }
+
+    if (m_sDBUSState.verifyStarted)
+        return;
+
     auto finger = "any"; // Any finger.
     const auto generation = m_sDBUSState.deviceGeneration;
     m_sDBUSState.device->callMethodAsync("VerifyStart").onInterface(DEVICE).withArguments(finger).uponReplyInvoke([this, isRetry, generation](std::optional<sdbus::Error> e) {
@@ -316,15 +364,20 @@ void CFingerprint::startVerify(bool isRetry) {
 
         if (e) {
             m_sDBUSState.verifying = false;
+            m_sDBUSState.verifyStarted = false;
             Log::logger->log(Log::WARN, "fprint: could not start verifying, {}", e->what());
             if (isRetry)
                 m_sFailureReason = "Fingerprint auth disabled (failed to restart)";
 
+            releaseDeviceAsync();
+
         } else if (m_sDBUSState.sleeping || m_sDBUSState.releasing) {
+            m_sDBUSState.verifyStarted = true;
             Log::logger->log(Log::INFO, "fprint: started verifying while sleeping, stopping");
             stopVerifyAsync(true);
         } else {
             Log::logger->log(Log::INFO, "fprint: started verifying");
+            m_sDBUSState.verifyStarted = true;
             if (isRetry) {
                 m_sDBUSState.retries++;
                 m_sPrompt = "Could not match fingerprint. Try again.";
@@ -339,9 +392,23 @@ void CFingerprint::startVerify(bool isRetry) {
 
 void CFingerprint::stopVerifyAsync(bool release) {
     m_sDBUSState.verifying = false;
+
+    if (m_pRefreshTimer) {
+        m_pRefreshTimer->cancel();
+        m_pRefreshTimer.reset();
+    }
+
     if (!m_sDBUSState.device) {
+        m_sDBUSState.verifyStarted = false;
         if (release)
             m_sDBUSState.releasing = false;
+        return;
+    }
+
+    if (!m_sDBUSState.claimed || !m_sDBUSState.verifyStarted) {
+        m_sDBUSState.verifyStarted = false;
+        if (release)
+            releaseDeviceAsync();
         return;
     }
 
@@ -358,13 +425,28 @@ void CFingerprint::stopVerifyAsync(bool release) {
         else
             Log::logger->log(Log::INFO, "fprint: stopped verification");
 
+        m_sDBUSState.verifyStarted = false;
+
         if (release)
             releaseDeviceAsync();
     });
 }
 
 void CFingerprint::releaseDeviceAsync() {
+    m_sDBUSState.verifying = false;
+
     if (!m_sDBUSState.device) {
+        m_sDBUSState.claiming      = false;
+        m_sDBUSState.claimed       = false;
+        m_sDBUSState.verifyStarted = false;
+        m_sDBUSState.releasing     = false;
+        if (!m_sDBUSState.sleeping && !m_sDBUSState.verifying && !m_sDBUSState.done && !m_sDBUSState.abort)
+            scheduleStartVerify();
+        return;
+    }
+
+    if (!m_sDBUSState.claimed) {
+        dropDeviceProxy();
         m_sDBUSState.releasing = false;
         if (!m_sDBUSState.sleeping && !m_sDBUSState.verifying && !m_sDBUSState.done && !m_sDBUSState.abort)
             scheduleStartVerify();
@@ -384,7 +466,10 @@ void CFingerprint::releaseDeviceAsync() {
 
         m_sDBUSState.device.reset();
         m_sDBUSState.deviceGeneration++;
-        m_sDBUSState.releasing = false;
+        m_sDBUSState.claiming      = false;
+        m_sDBUSState.claimed       = false;
+        m_sDBUSState.verifyStarted = false;
+        m_sDBUSState.releasing     = false;
 
         if (!m_sDBUSState.sleeping && !m_sDBUSState.verifying && !m_sDBUSState.done && !m_sDBUSState.abort)
             scheduleStartVerify();
@@ -393,14 +478,23 @@ void CFingerprint::releaseDeviceAsync() {
 
 bool CFingerprint::stopVerify() {
     m_sDBUSState.verifying = false;
-    if (!m_sDBUSState.device)
+
+    if (m_pRefreshTimer) {
+        m_pRefreshTimer->cancel();
+        m_pRefreshTimer.reset();
+    }
+
+    if (!m_sDBUSState.device || !m_sDBUSState.claimed || !m_sDBUSState.verifyStarted)
         return false;
+
     try {
         m_sDBUSState.device->callMethod("VerifyStop").onInterface(DEVICE);
     } catch (sdbus::Error& e) {
         Log::logger->log(Log::WARN, "fprint: could not stop verifying, {}", e.what());
+        m_sDBUSState.verifyStarted = false;
         return false;
     }
+    m_sDBUSState.verifyStarted = false;
     Log::logger->log(Log::INFO, "fprint: stopped verification");
     return true;
 }
@@ -408,17 +502,23 @@ bool CFingerprint::stopVerify() {
 bool CFingerprint::releaseDevice() {
     if (!m_sDBUSState.device)
         return false;
+
+    m_sDBUSState.verifying = false;
+
+    if (!m_sDBUSState.claimed) {
+        dropDeviceProxy();
+        return false;
+    }
+
     try {
         m_sDBUSState.device->callMethod("Release").onInterface(DEVICE);
     } catch (sdbus::Error& e) {
         Log::logger->log(Log::WARN, "fprint: could not release device, {}", e.what());
-        m_sDBUSState.device.reset();
-        m_sDBUSState.deviceGeneration++;
+        dropDeviceProxy();
         return false;
     }
 
-    m_sDBUSState.device.reset();
-    m_sDBUSState.deviceGeneration++;
+    dropDeviceProxy();
     Log::logger->log(Log::INFO, "fprint: released device");
     return true;
 }

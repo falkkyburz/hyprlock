@@ -32,6 +32,9 @@ class CFingerprint : public IAuthImplementation {
         int                            retries   = 0;
         bool                           sleeping         = false;
         bool                           verifying        = false;
+        bool                           claiming         = false;
+        bool                           claimed          = false;
+        bool                           verifyStarted    = false;
         bool                           releasing        = false;
         bool                           startScheduled   = false;
         bool                           sleepSignalSeen  = false;
@@ -50,6 +53,7 @@ class CFingerprint : public IAuthImplementation {
     void        handleVerifyStatus(const std::string& result, const bool done);
 
     bool        createDeviceProxy();
+    void        dropDeviceProxy();
     void        claimDevice();
     void        scheduleStartVerify();
     void        scheduleRefreshTimer();
